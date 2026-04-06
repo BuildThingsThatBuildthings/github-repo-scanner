@@ -1,7 +1,7 @@
 ---
 name: repo-scanner
 description: Deep security audit of any GitHub repo or local directory. Detects malicious code, supply chain attacks, prompt injection, hidden unicode, obfuscated payloads, credential leaks, backdoors, AI-targeted exploits, known CVEs, data flow vulnerabilities, CI/CD injection, and credential exfiltration patterns that traditional scanners miss. Covers attack classes including Trojan Source, typosquatting, binary polyglots, git history forensics, social engineering via docs, and language-specific exploit patterns. Use this skill whenever the user asks to check a repo for safety, audit code they didn't write, review a dependency before installing, verify an open-source project, or scan for malware/backdoors. Also triggers on "/repo-scanner".
-allowed-tools: Bash(git:*), Bash(python3:*), Bash(find:*), Bash(file:*), Bash(wc:*), Bash(ls:*), Bash(rm:*), Bash(mkdir:*), Bash(cat:*), Bash(chmod:*), Read, Glob, Grep, Agent
+allowed-tools: Bash(gh:*), Bash(python3:*), Bash(find:*), Bash(file:*), Bash(wc:*), Bash(ls:*), Bash(rm:*), Bash(mkdir:*), Bash(cat:*), Bash(chmod:*), Bash(tar:*), Bash(git:*), Read, Glob, Grep, Agent
 ---
 
 # Repo Security Scanner
@@ -19,13 +19,53 @@ The reason this scanner exists is that traditional tools (npm audit, Snyk, etc.)
 
 ## How to Run
 
-### Step 1: Acquire the target
+### Step 1: Acquire the target SAFELY
+
+**NEVER `git clone` an untrusted repo.** Cloning executes git hooks (`post-checkout`, `post-merge`), smudge/clean filter drivers, submodule init scripts, and LFS hooks — all of which run arbitrary code. Cloning a malicious repo infects the machine before the scan even starts.
 
 | Input | Action |
 |-------|--------|
-| GitHub URL | `git clone` to `/tmp/scan-<name>-<timestamp>`, record commit SHA |
-| Local path | Verify exists, record path |
+| GitHub URL | **Download tarball via `gh` CLI** (see below) — no git execution, no hooks |
+| Local path | Verify exists, record path. **Do NOT run any git commands that trigger hooks.** |
 | Nothing | Use current working directory |
+
+**Safe remote acquisition via `gh` CLI:**
+
+```bash
+# Create isolated scan directory
+SCAN_DIR="/tmp/scan-<name>-$(date +%s)"
+mkdir -p "$SCAN_DIR"
+
+# Download source tarball — no .git/, no hooks, no filters, no submodules
+gh api repos/<owner>/<repo>/tarball -H "Accept: application/vnd.github+json" > /tmp/scan-archive.tar.gz
+tar xzf /tmp/scan-archive.tar.gz -C "$SCAN_DIR" --strip-components=1
+rm /tmp/scan-archive.tar.gz
+
+# Record the default branch HEAD SHA for the report
+gh api repos/<owner>/<repo>/commits/HEAD --jq '.sha' 2>/dev/null
+```
+
+This gives you all source files without any git execution. No hooks fire, no filters run, no submodules initialize.
+
+**For git history forensics (Phase 1)**, use the GitHub API — never a local clone:
+
+```bash
+# Recent commits (replaces git log)
+gh api repos/<owner>/<repo>/commits --jq '.[].commit.message' | head -20
+
+# Deleted files (replaces git log --diff-filter=D)
+gh api repos/<owner>/<repo>/commits --jq '.[].sha' | head -20 | while read sha; do
+  gh api "repos/<owner>/<repo>/commits/$sha" --jq '.files[] | select(.status=="removed") | .filename' 2>/dev/null
+done
+
+# Check for force pushes (via audit log if available, or branch protection status)
+gh api repos/<owner>/<repo>/events --jq '.[] | select(.type=="PushEvent") | {actor: .actor.login, ref: .payload.ref, forced: .payload.forced}' 2>/dev/null
+
+# Commit authors (replaces git log --format)
+gh api repos/<owner>/<repo>/commits --paginate --jq '.[].commit.author | "\(.name) <\(.email)>"' | sort -u
+```
+
+**If the repo is local and already on disk**, it's already been cloned — the damage (if any) is done. Scan it in place but still avoid running `git checkout`, `git submodule update`, or anything that triggers hooks. Safe git read-only commands: `git log`, `git show`, `git diff`, `git ls-files`, `git cat-file`.
 
 ### Step 2: Run all phases
 
@@ -44,22 +84,41 @@ Use the output format at the end of this document. Every finding needs a file pa
 Map the attack surface before reading code.
 
 ```bash
-# File inventory
-find <target> -not -path '*/.git/*' -type f | wc -l
-find <target> -not -path '*/.git/*' -type f -name '.*'        # hidden files
-find <target> -not -path '*/.git/*' -type l                    # symlinks
-find <target> -not -path '*/.git/*' -type f -perm +111 | grep -v '.git'  # executables
-find <target> -not -path '*/.git/*' -type f -empty             # empty files (payload placeholders)
+# File inventory (on the extracted tarball — no .git/ exists)
+find <target> -type f | wc -l
+find <target> -type f -name '.*'        # hidden files
+find <target> -type l                    # symlinks (can still exist in tarballs)
+find <target> -type f -perm +111         # executables
+find <target> -type f -empty             # empty files (payload placeholders)
 
 # Binary detection — every binary is suspicious until explained
-find <target> -not -path '*/.git/*' -type f -exec file {} \; | grep -v 'ASCII\|UTF-8\|JSON\|empty\|text'
-
-# Git history (if .git exists)
-git -C <target> log --oneline -20
-git -C <target> log --diff-filter=D --name-only --pretty=format:""  # deleted files (may have had secrets)
-git -C <target> log --diff-filter=A --name-only -- '*.exe' '*.dll' '*.so' '*.bin'  # binary additions
-git -C <target> reflog 2>/dev/null | grep 'force'  # force pushes
+find <target> -type f -exec file {} \; | grep -v 'ASCII\|UTF-8\|JSON\|empty\|text'
 ```
+
+**Git history forensics via `gh` API** (for remote repos — no local clone needed):
+
+```bash
+# Recent commits
+gh api repos/<owner>/<repo>/commits --jq '.[] | "\(.sha[:7]) \(.commit.message | split("\n")[0])"' | head -20
+
+# Deleted files across recent commits (may have had secrets)
+gh api repos/<owner>/<repo>/commits --jq '.[].sha' | head -20 | while read sha; do
+  gh api "repos/<owner>/<repo>/commits/$sha" --jq '.files[]? | select(.status=="removed") | .filename' 2>/dev/null
+done
+
+# Binary file additions
+gh api repos/<owner>/<repo>/commits --jq '.[].sha' | head -20 | while read sha; do
+  gh api "repos/<owner>/<repo>/commits/$sha" --jq '.files[]? | select(.status=="added") | select(.filename | test("\\.(exe|dll|so|bin|dylib)$")) | .filename' 2>/dev/null
+done
+
+# Force push detection
+gh api repos/<owner>/<repo>/events --jq '.[] | select(.type=="PushEvent") | select(.payload.forced==true) | {actor: .actor.login, ref: .payload.ref, date: .created_at}' 2>/dev/null
+
+# Commit authors — look for throwaway/suspicious accounts
+gh api repos/<owner>/<repo>/commits --paginate --jq '.[].commit.author | "\(.name) <\(.email)>"' | sort -u
+```
+
+For **local repos** that are already on disk, use read-only git commands only (`git log`, `git show`, `git diff`, `git ls-files`). Never run `git checkout`, `git submodule update`, or anything that triggers hooks.
 
 What you're looking for:
 - Binary files in a project that shouldn't have them (`.exe`, `.dll`, `.so`, `.dylib` in a JS/Python project)
@@ -512,7 +571,7 @@ This scanner reads every file and applies heuristic analysis, but it has inheren
 
 ## Rules
 
-1. Clone remote repos to `/tmp` — never into the user's workspace
+1. **NEVER `git clone` untrusted repos** — download tarballs via `gh api repos/{owner}/{repo}/tarball` to `/tmp`. Use `gh` API for git history forensics. Cloning executes hooks and infects the machine before the scan starts.
 2. Read every source file — do not sample
 3. Always run `scripts/unicode_scanner.py` — grep misses encoding attacks
 4. Verify binary file types with `file` — extensions lie
