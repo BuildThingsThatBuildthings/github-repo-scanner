@@ -1,0 +1,23 @@
+{
+  "skill_name": "repo-scanner",
+  "evals": [
+    {
+      "id": 1,
+      "prompt": "scan this repo for me: https://github.com/nicbarker/clay",
+      "expected_output": "A structured security report with verdict, findings by severity, and a summary of what was checked. Should complete without errors and correctly identify the tech stack (C library). Should not produce excessive false positives for a legitimate open-source project.",
+      "files": []
+    },
+    {
+      "id": 2,
+      "prompt": "/repo-scanner https://github.com/nicbarker/clay",
+      "expected_output": "Same as eval 1 — the skill should trigger on the slash command and produce a full security scan report.",
+      "files": []
+    },
+    {
+      "id": 3,
+      "prompt": "I cloned a repo to /tmp/seo-audit-skill and I want to make sure it's safe before I install its npm packages. Can you check it for anything sketchy?",
+      "expected_output": "Should trigger the repo-scanner skill, scan the local directory, and produce a report. Should pay special attention to package.json lifecycle hooks since the user mentioned npm install. The repo at /tmp/seo-audit-skill was cloned earlier and is a legitimate SEO tool — should come back clean or with only informational findings.",
+      "files": []
+    }
+  ]
+}
